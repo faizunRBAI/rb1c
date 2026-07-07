@@ -228,13 +228,22 @@ resource "aws_security_group" "app" {
   description = "App instances security group"
   vpc_id      = aws_vpc.main.id
 
-  # SSH from anywhere (for Ansible via bastion or direct - tightened below)
   ingress {
     description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Inline rule so Terraform owns the full ingress set and never
+  # silently drops this rule when reconciling the SG resource.
+  ingress {
+    description     = "App port from ALB"
+    from_port       = 8000
+    to_port         = 8000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
   egress {
@@ -247,17 +256,6 @@ resource "aws_security_group" "app" {
   tags = {
     Name = "${var.project_name}-app-sg"
   }
-}
-
-# Allow ALB -> app instances on port 8000 (standalone rule to avoid cycle)
-resource "aws_security_group_rule" "alb_to_app" {
-  type                     = "ingress"
-  from_port                = 8000
-  to_port                  = 8000
-  protocol                 = "tcp"
-  security_group_id        = aws_security_group.app.id
-  source_security_group_id = aws_security_group.alb.id
-  description              = "Allow ALB to reach app on port 8000"
 }
 
 resource "aws_security_group" "rds" {
@@ -396,7 +394,9 @@ resource "aws_autoscaling_group" "app" {
   }
 
   health_check_type         = "ELB"
-  health_check_grace_period = 300
+  # 600s gives ample time for instance boot + full Ansible configuration
+  # before ELB health checks begin penalising newly launched instances.
+  health_check_grace_period = 600
 
   depends_on = [
     aws_lb.main,
