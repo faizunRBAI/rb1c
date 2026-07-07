@@ -39,7 +39,6 @@ jobs:
     needs: [test]
     outputs:
       bastion_ip: ${{ steps.tf_outputs.outputs.bastion_ip }}
-      asg_name: ${{ steps.tf_outputs.outputs.asg_name }}
 
     steps:
       - name: Checkout
@@ -82,7 +81,6 @@ jobs:
         working-directory: terraform
         run: |
           echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> "$GITHUB_OUTPUT"
-          echo "asg_name=$(terraform output -raw asg_name)"            >> "$GITHUB_OUTPUT"
 
   #  configure 
   configure:
@@ -129,7 +127,19 @@ jobs:
       - name: Discover ASG instance private IPs
         id: discover_instances
         run: |
-          ASG_NAME="${{ needs.provision.outputs.asg_name }}"
+          # Discover the ASG name via resource tags (avoids passing secret-containing
+          # values as job outputs, which GitHub Actions silently suppresses).
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters "Name=tag:ManagedBy,Values=udap" \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+
+          if [ -z "${ASG_NAME}" ] || [ "${ASG_NAME}" = "None" ]; then
+            echo "ERROR: Could not discover ASG name from tags"
+            exit 1
+          fi
+          echo "Discovered ASG: ${ASG_NAME}"
+
           echo "Discovering instances in ASG: ${ASG_NAME}"
           # Wait up to 5 minutes for instances to be InService
           for i in $(seq 1 30); do
