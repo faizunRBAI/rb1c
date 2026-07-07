@@ -1,0 +1,179 @@
+---
+- name: Configure Python FastAPI application
+  hosts: all
+  become: true
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: ubuntu
+    service_name: python-app
+
+  tasks:
+    #  System packages 
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - default-mysql-client
+          - pkg-config
+          - default-libmysqlclient-dev
+          - build-essential
+          - git
+          - curl
+        state: present
+
+    #  App directory 
+
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    #  Copy application code 
+
+    - name: Sync app package directory
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../app/"
+        dest: "{{ app_dir }}/app/"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+        directory_mode: "0755"
+
+    - name: Sync main.py entrypoint
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../main.py"
+        dest: "{{ app_dir }}/main.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+
+    - name: Copy requirements.txt
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../requirements.txt"
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+
+    - name: Check if public/ directory exists locally
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../public"
+      register: public_dir_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Sync public/ static assets if present
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../public/"
+        dest: "{{ app_dir }}/public/"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+        directory_mode: "0755"
+      when: public_dir_stat.stat.exists
+
+    #  Python virtual environment 
+
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv {{ venv_dir }}
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip in venv
+      ansible.builtin.pip:
+        name: pip
+        state: latest
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_python: python3
+      become_user: "{{ app_user }}"
+
+    - name: Install Python dependencies from requirements.txt
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_python: python3
+      become_user: "{{ app_user }}"
+
+    #  Environment file 
+
+    - name: Write systemd environment file
+      ansible.builtin.shell: |
+        cat > /opt/app/app.env << 'ENVEOF'
+        PORT=8000
+        HOST=0.0.0.0
+        APP_ENV=production
+        DATABASE_URL={{ database_url | default('') }}
+        ENVEOF
+        chmod 640 /opt/app/app.env
+        chown root:{{ app_user }} /opt/app/app.env
+      args:
+        executable: /bin/bash
+
+    #  Systemd service 
+
+    - name: Create systemd service unit for python-app
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/python-app.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Python FastAPI Application (rb1c)
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          Type=notify
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/app.env
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+              -k uvicorn.workers.UvicornWorker \
+              -w 4 \
+              -b 0.0.0.0:8000 \
+              --timeout 120 \
+              --access-logfile - \
+              --error-logfile -
+          Restart=always
+          RestartSec=5
+          KillMode=mixed
+          TimeoutStopSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable and start python-app service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: restarted
+
+    - name: Wait for application to be healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8000/health"
+        status_code: [200, 307]
+        timeout: 5
+      register: health_result
+      retries: 12
+      delay: 10
+      until: health_result.status in [200, 307]
